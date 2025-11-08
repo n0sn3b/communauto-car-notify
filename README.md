@@ -41,6 +41,7 @@ Options:
     Object.keys(branchIds).join(", ")
   }
   -l, --location <coord>  Location coordinates (e.g. "43.7,-79.4")
+  -r, --radius <distance> Search radius in meters or kilometers (e.g. "500", "2km")
   -h, --help              Show this help message
 
 Examples:
@@ -48,4 +49,6 @@ Examples:
   node run.mjs -d 10 -c vancouver
   node run.mjs -l "45.5,-73.6"
   node run.mjs --help
-``````
+```
+
+Use `--radius` (or `-r`) to override the default 10km search radius. Distances can be entered in meters (e.g. `--radius 750`) or kilometers (e.g. `--radius 2km`).

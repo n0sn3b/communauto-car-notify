@@ -24,6 +24,10 @@ const { values } = parseArgs({
       type: 'string',
       short: 'l',
     },
+    radius: {
+      type: 'string',
+      short: 'r',
+    },
     help: {
       type: "boolean",
       short: "h",
@@ -41,6 +45,7 @@ Options:
     Object.keys(branchIds).join(", ")
   }
   -l, --location <coord>  Location coordinates (e.g. "43.7,-79.4")
+  -r, --radius <distance> Search radius in meters or kilometers (e.g. "500", "2km")
   -h, --help              Show this help message
 
 Examples:
@@ -78,7 +83,11 @@ const distanceRadii = [
   200,
 ];
 
-let distanceRadius = distanceRadii[0];
+const defaultRadius = distanceRadii[0];
+
+const customRadius = values.radius ? parseRadius(values.radius) : undefined;
+
+let distanceRadius = customRadius ?? defaultRadius;
 
 let notificationId, notifyResult;
 
@@ -92,6 +101,8 @@ console.log('Using City Branch: %s. Branch ID: %i', values.city, branchId);
 
 const location = values.location ? values.location.split(',').map(c => parseFloat(c.trim())) : await retry(async () => await getLocation())
 console.log('Current location: %s, %s', ...location);
+
+console.log('Initial search radius: %s', humanDistance(distanceRadius));
 
 
 
@@ -260,4 +271,24 @@ async function retry(cb, times = 3, delay = 1000) {
 
   }
 
+}
+
+function parseRadius(input) {
+  const trimmed = input.trim().toLowerCase();
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)(km|m)?$/);
+
+  if (!match) {
+    throw new Error(`Invalid radius value: ${input}`);
+  }
+
+  const value = parseFloat(match[1]);
+  const unit = match[2] ?? 'm';
+
+  const distanceInMeters = unit === 'km' ? value * 1000 : value;
+
+  if (!Number.isFinite(distanceInMeters) || distanceInMeters <= 0) {
+    throw new Error(`Radius must be a positive number. Received: ${input}`);
+  }
+
+  return Math.round(distanceInMeters);
 }
