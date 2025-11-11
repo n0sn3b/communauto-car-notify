@@ -343,6 +343,9 @@ async function login(username, password, branchId) {
       'Accept': 'application/json, text/javascript, */*; q=0.01',
       'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
       'X-Requested-With': 'XMLHttpRequest',
+      'Origin': 'https://www.reservauto.net',
+      'Referer': `https://www.reservauto.net/Scripts/Client/Ajax/Mobile/Login.asp?BranchID=${branchId}`,
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 12; CommunautoBot) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36',
     },
     body: form.toString(),
   });
@@ -351,30 +354,35 @@ async function login(username, password, branchId) {
     throw new Error(`Login request failed with status ${response.status}`);
   }
 
-  const sessionCookie = extractSessionCookie(response.headers.get('set-cookie'));
-
   const rawBody = await response.text();
-  let body;
-  try {
-    body = rawBody ? JSON.parse(rawBody) : {};
-  } catch (error) {
-    throw new Error(`Unexpected login response: ${rawBody.slice(0, 200)}`);
+  const body = parseLoginBody(rawBody);
+
+  const account = extractLoginAccount(body);
+  if (!account) {
+    const message = extractLoginMessage(body);
+    throw new Error(
+      message
+        ? `Login rejected: ${message}`
+        : `Unexpected login response structure: ${truncateForError(rawBody)}`,
+    );
   }
 
-  const account = Array.isArray(body?.data) ? body.data[0] : body?.data ?? body?.Data ?? null;
-  const customerId = account?.CustomerID ?? account?.CustomerId;
+  const customerId = account.CustomerID ?? account.CustomerId ?? account.customerId;
 
   if (!customerId) {
-    const message = body?.Message || body?.ErrorMessage || account?.Message;
+    const message = extractLoginMessage(body, account);
     throw new Error(
       message ? `Login rejected: ${message}` : 'Invalid Communauto credentials returned by login endpoint.',
     );
   }
 
+  const sessionCookie = extractSessionCookie(response.headers.get('set-cookie'));
+
   return {
     customerId,
-    providerNo: account?.ProviderNo ?? account?.ProviderNO ?? undefined,
-    cityId: account?.CityID ? parseInt(account.CityID, 10) : account?.CityId ? parseInt(account.CityId, 10) : undefined,
+    providerNo:
+      account.ProviderNo ?? account.ProviderNO ?? account.providerNo ?? account.providerNO ?? undefined,
+    cityId: extractNumeric(account.CityID ?? account.CityId ?? account.cityId),
     cookie: sessionCookie,
   };
 }
@@ -511,6 +519,75 @@ function parseCredentialFallback(contents) {
 function extractSessionCookie(header) {
   if (!header) return undefined;
 
-  const firstCookie = header.split(/,(?=[^;,]+=)/)[0] ?? header;
-  return firstCookie.split(';')[0];
+  const parts = header.split(/,(?=[^;,]+=)/g).map(part => part.trim()).filter(Boolean);
+  const cookies = parts.map(chunk => chunk.split(';')[0]).filter(Boolean);
+  return cookies.length ? cookies.join('; ') : undefined;
+}
+
+function parseLoginBody(rawBody) {
+  if (!rawBody) return {};
+
+  const trimmed = rawBody.trim();
+  if (!trimmed) return {};
+
+  try {
+    return JSON.parse(trimmed);
+  } catch (error) {
+    const jsonpMatch = trimmed.match(/^[^(]+\((.*)\)$/s);
+    if (jsonpMatch) {
+      return parseLoginBody(jsonpMatch[1]);
+    }
+    throw new Error(`Unexpected login response: ${truncateForError(trimmed)}`);
+  }
+}
+
+function extractLoginAccount(body) {
+  const candidates = [];
+
+  const pushCandidate = value => {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item && typeof item === 'object') {
+          candidates.push(item);
+        }
+      }
+    } else {
+      candidates.push(value);
+    }
+  };
+
+  pushCandidate(body?.data);
+  pushCandidate(body?.Data);
+  pushCandidate(body?.d);
+  pushCandidate(body);
+
+  return candidates.find(item =>
+    item && (item.CustomerID || item.CustomerId || item.customerId || item.ProviderNo || item.Access),
+  ) ?? null;
+}
+
+function extractLoginMessage(body, account) {
+  const sources = [
+    body?.Message,
+    body?.ErrorMessage,
+    body?.message,
+    body?.error,
+    account?.Message,
+    account?.ErrorMessage,
+    Array.isArray(body?.errors) ? body.errors.map(err => err.message ?? err.Message).join('; ') : undefined,
+  ];
+
+  return sources.find(value => typeof value === 'string' && value.trim())?.trim();
+}
+
+function truncateForError(text, max = 200) {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}…`;
+}
+
+function extractNumeric(value) {
+  if (value == null) return undefined;
+  const number = parseInt(value, 10);
+  return Number.isFinite(number) ? number : undefined;
 }
