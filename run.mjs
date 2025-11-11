@@ -328,55 +328,83 @@ function parseRadius(input) {
 }
 
 async function login(username, password, branchId) {
-  const url = 'https://www.reservauto.net/Scripts/Client/Ajax/Mobile/Login.asp';
-  const form = new URLSearchParams({
+  const baseUrl = 'https://www.reservauto.net/Scripts/Client/Ajax/Mobile/Login.asp';
+  const sharedHeaders = {
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 12; CommunautoBot) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36',
+    'Referer': `https://www.reservauto.net/Scripts/Client/Ajax/Mobile/Login.asp?BranchID=${branchId}`,
+  };
+
+  const queryParams = new URLSearchParams({
     BranchID: String(branchId),
     Username: username,
     Password: password,
     RememberMe: 'true',
     LanguageID: '2',
+    callback: 'communautoLogin',
   });
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Accept': 'application/json, text/javascript, */*; q=0.01',
-      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-      'X-Requested-With': 'XMLHttpRequest',
-      'Origin': 'https://www.reservauto.net',
-      'Referer': `https://www.reservauto.net/Scripts/Client/Ajax/Mobile/Login.asp?BranchID=${branchId}`,
-      'User-Agent': 'Mozilla/5.0 (Linux; Android 12; CommunautoBot) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36',
-    },
-    body: form.toString(),
+  const loginResponse = await fetch(`${baseUrl}?${queryParams.toString()}`, {
+    method: 'GET',
+    headers: sharedHeaders,
   });
 
-  if (!response.ok) {
-    throw new Error(`Login request failed with status ${response.status}`);
+  if (!loginResponse.ok) {
+    throw new Error(`Login request failed with status ${loginResponse.status}`);
   }
 
-  const rawBody = await response.text();
-  const body = parseLoginBody(rawBody);
+  const loginBodyText = await loginResponse.text();
+  const loginBody = parseLoginBody(loginBodyText);
 
-  const account = extractLoginAccount(body);
+  const cookies = collectSetCookies(loginResponse.headers.get('set-cookie'));
+
+  let account = extractLoginAccount(loginBody);
+
+  if (!account || !hasNonEmptyLoginValue(account)) {
+    if (cookies.length) {
+      const sessionCookieHeader = cookies.join('; ');
+      const sessionResponse = await fetch(`${baseUrl}?URLEnd=URLEnd&BranchID=${branchId}`, {
+        method: 'GET',
+        headers: {
+          ...sharedHeaders,
+          Cookie: sessionCookieHeader,
+        },
+      });
+
+      if (sessionResponse.ok) {
+        const sessionBodyText = await sessionResponse.text();
+        const sessionBody = parseLoginBody(sessionBodyText);
+        const sessionCookies = collectSetCookies(sessionResponse.headers.get('set-cookie'));
+        if (sessionCookies.length) {
+          cookies.push(...sessionCookies);
+        }
+        const sessionAccount = extractLoginAccount(sessionBody);
+        if (sessionAccount && hasNonEmptyLoginValue(sessionAccount)) {
+          account = sessionAccount;
+        }
+      }
+    }
+  }
+
   if (!account) {
-    const message = extractLoginMessage(body);
-    const fallback = hasLoginCandidate(body)
+    const message = extractLoginMessage(loginBody);
+    const fallback = hasLoginCandidate(loginBody)
       ? 'Login rejected: Invalid username or password.'
-      : `Unexpected login response structure: ${truncateForError(rawBody)}`;
+      : `Unexpected login response structure: ${truncateForError(loginBodyText)}`;
     throw new Error(message ? `Login rejected: ${message}` : fallback);
   }
 
   const customerId = account.CustomerID ?? account.CustomerId ?? account.customerId;
 
-  if (!customerId) {
-    const message = extractLoginMessage(body, account);
+  if (!customerId || String(customerId).trim() === '') {
+    const message = extractLoginMessage(loginBody, account) ?? extractLoginMessage(account);
     const fallback = isBlankAccount(account)
       ? 'Invalid username or password.'
       : 'Invalid Communauto credentials returned by login endpoint.';
     throw new Error(`Login rejected: ${message ?? fallback}`);
   }
 
-  const sessionCookie = extractSessionCookie(response.headers.get('set-cookie'));
+  const sessionCookie = cookies.length ? cookies.join('; ') : undefined;
 
   return {
     customerId,
@@ -385,6 +413,20 @@ async function login(username, password, branchId) {
     cityId: extractNumeric(account.CityID ?? account.CityId ?? account.cityId),
     cookie: sessionCookie,
   };
+}
+
+function collectSetCookies(header) {
+  if (!header) return [];
+  const entries = header
+    .split(/,(?=[^;,]+=)/g)
+    .map(value => value.trim())
+    .filter(Boolean);
+  const cookies = [];
+  for (const entry of entries) {
+    const [cookie] = entry.split(';');
+    if (cookie) cookies.push(cookie.trim());
+  }
+  return cookies;
 }
 
 async function blockCar(car, session) {
@@ -514,14 +556,6 @@ function parseCredentialFallback(contents) {
   }
 
   return Object.keys(data).length ? data : null;
-}
-
-function extractSessionCookie(header) {
-  if (!header) return undefined;
-
-  const parts = header.split(/,(?=[^;,]+=)/g).map(part => part.trim()).filter(Boolean);
-  const cookies = parts.map(chunk => chunk.split(';')[0]).filter(Boolean);
-  return cookies.length ? cookies.join('; ') : undefined;
 }
 
 function parseLoginBody(rawBody) {
