@@ -104,12 +104,6 @@ const distanceRadii = [
 
 const defaultRadius = distanceRadii[0];
 
-const customRadius = values.radius ? parseRadius(values.radius) : undefined;
-
-let distanceRadius = customRadius ?? defaultRadius;
-
-let notificationId, notifyResult;
-
 if (!branchIds[values.city]) {
   throw new Error(`City ${values.city} not yet supported! File a bug`);
 }
@@ -117,79 +111,85 @@ const branchId = branchIds[values.city];
 
 console.log('Using City Branch: %s. Branch ID: %i', values.city, branchId);
 
+async function main() {
+  const customRadius = values.radius ? parseRadius(values.radius) : undefined;
+  let distanceRadius = customRadius ?? defaultRadius;
+  let notificationId;
+  let notifyResult;
 
-const credentials = await resolveCredentials(values);
+  const credentials = await resolveCredentials(values);
 
-const authSession = await login(credentials.username, credentials.password, branchId);
+  const authSession = await login(credentials.username, credentials.password, branchId);
 
-console.log('Authenticated successfully. Customer ID: %s', authSession.customerId);
+  console.log('Authenticated successfully. Customer ID: %s', authSession.customerId);
 
-const location = values.location ? values.location.split(',').map(c => parseFloat(c.trim())) : await retry(async () => await getLocation())
-console.log('Current location: %s, %s', ...location);
+  const location = values.location
+    ? values.location.split(',').map(c => parseFloat(c.trim()))
+    : await retry(async () => await getLocation());
+  console.log('Current location: %s, %s', ...location);
 
-console.log('Initial search radius: %s', humanDistance(distanceRadius));
+  console.log('Initial search radius: %s', humanDistance(distanceRadius));
 
+  while (true) {
+    const cars = await getCars(location);
+    const filteredCars = cars
+      .filter(car => car.distance <= distanceRadius)
+      .sort((a, b) => a.distance - b.distance);
 
+    console.log(
+      '%i cars found. %i within %s. Waiting %i seconds',
+      cars.length,
+      filteredCars.length,
+      humanDistance(distanceRadius),
+      pause,
+    );
 
-while(true) {
-  const cars = await getCars(location);
-  const filteredCars = cars
-    .filter(car => car.distance <= distanceRadius)
-    .sort((a,b) => a.distance - b.distance);
+    if (filteredCars.length) {
+      const car = filteredCars[0];
 
-  console.log(
-    '%i cars found. %i within %s. Waiting %i seconds',
-    cars.length,
-    filteredCars.length,
-    humanDistance(distanceRadius),
-    pause,
-  );
+      const nextSmallerRadius = distanceRadii.find(i => i < car.distance);
 
-  if (filteredCars.length) {
+      const args = [
+        '-u',
+        'critical',
+        '-t',
+        '6000',
+        '-p',
+        '-A',
+        'block=Block car',
+        '-A',
+        'stop=Stop looking',
+        'Car found!',
+        `${car.brand} ${car.model} is ${Math.floor(car.distance)}m away`,
+      ];
+      if (nextSmallerRadius) {
+        args.push('-A', 'reduce=Reduce radius to ' + humanDistance(nextSmallerRadius));
+      }
+      if (notificationId) args.push('-r', notificationId);
 
-    const car = filteredCars[0];
+      const res = spawnSync('notify-send', args);
 
-    const nextSmallerRadius = distanceRadii.find(i => i < car.distance);
-
-    const args = [
-      '-u',
-      'critical',
-      '-t', '6000',
-      '-p',
-      '-A', 'block=Block car',
-      '-A', 'stop=Stop looking',
-      'Car found!',
-      `${car.brand} ${car.model} is ${Math.floor(car.distance)}m away`
-    ];
-    if (nextSmallerRadius) {
-      args.push('-A', 'reduce=Reduce radius to ' + humanDistance(nextSmallerRadius));
+      [notificationId, notifyResult] = res.stdout.toString().split('\n');
+      if (notifyResult) notifyResult = notifyResult.trim();
+      switch (notifyResult) {
+        case 'block':
+          try {
+            const booking = await blockCar(car, authSession);
+            console.log('Block request completed: %j', booking);
+          } catch (err) {
+            console.error('Failed to block car: %s', err.message);
+          }
+          break;
+        case 'reduce':
+          distanceRadius = nextSmallerRadius;
+          break;
+        case 'stop':
+          process.exit();
+      }
     }
-    if (notificationId) args.push('-r', notificationId);
 
-    const res = spawnSync('notify-send', args);
-
-    [notificationId, notifyResult] = res.stdout.toString().split('\n');
-    if (notifyResult) notifyResult = notifyResult.trim();
-    switch(notifyResult) {
-      case 'block':
-        try {
-          const booking = await blockCar(car, authSession);
-          console.log('Block request completed: %j', booking);
-        } catch (err) {
-          console.error('Failed to block car: %s', err.message);
-        }
-        break;
-      case 'reduce' :
-        distanceRadius = nextSmallerRadius;
-        break;
-      case 'stop':
-        process.exit();
-    }
-
+    await wait(pause * 1000);
   }
-
-  await wait(pause * 1000);
-
 }
 
 //https://www.reservauto.net/WCF/LSI/LSIBookingServiceV3.svc/GetAvailableVehicles?BranchID=2&LanguageID=2
@@ -654,3 +654,5 @@ function extractNumeric(value) {
   const number = parseInt(value, 10);
   return Number.isFinite(number) ? number : undefined;
 }
+
+await main();
