@@ -46,6 +46,7 @@ Options:
   -r, --radius <distance> Search radius in meters or kilometers (e.g. "500", "2km")
   -U, --username <user>   Communauto login username (required to block a car)
   -P, --password <pass>   Communauto login password (required to block a car)
+  -F, --auth-file <path>  Path to JSON credentials file with "username" and "password"
   -h, --help              Show this help message
 
 Examples:
@@ -54,5 +55,17 @@ Examples:
   node run.mjs -l "45.5,-73.6"
   node run.mjs -r 2km
   node run.mjs --city montreal --username you@example.com --password secret
+  node run.mjs --auth-file creds.json
   node run.mjs --help
 ```
+
+To load credentials from disk, create a JSON file that looks like this:
+
+```json
+{
+  "username": "you@example.com",
+  "password": "supersecret"
+}
+```
+
+Then start the watcher with `node run.mjs --auth-file creds.json` (you can still override either field with `--username` or `--password`).

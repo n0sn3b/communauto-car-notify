@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { execSync, spawnSync } from 'child_process';
+import { readFile } from 'fs/promises';
 import { parseArgs } from 'util';
 
 const branchIds = {
@@ -36,6 +37,10 @@ const { values } = parseArgs({
       type: 'string',
       short: 'P',
     },
+    'auth-file': {
+      type: 'string',
+      short: 'F',
+    },
     help: {
       type: "boolean",
       short: "h",
@@ -56,6 +61,7 @@ Options:
   -r, --radius <distance> Search radius in meters or kilometers (e.g. "500", "2km")
   -U, --username <user>   Communauto login username (required to block a car)
   -P, --password <pass>   Communauto login password (required to block a car)
+  -F, --auth-file <path>  Path to JSON credentials file with "username" and "password"
   -h, --help              Show this help message
 
 Examples:
@@ -64,6 +70,7 @@ Examples:
   node run.mjs -l "45.5,-73.6"
   node run.mjs -r 2km
   node run.mjs --city montreal --username you@example.com --password secret
+  node run.mjs --auth-file creds.json
   node run.mjs --help
 `);
   process.exit();
@@ -111,11 +118,9 @@ const branchId = branchIds[values.city];
 console.log('Using City Branch: %s. Branch ID: %i', values.city, branchId);
 
 
-if (!values.username || !values.password) {
-  throw new Error('Blocking a car requires --username and --password credentials.');
-}
+const credentials = await resolveCredentials(values);
 
-const authSession = await login(values.username, values.password, branchId);
+const authSession = await login(credentials.username, credentials.password, branchId);
 
 console.log('Authenticated successfully. Customer ID: %s', authSession.customerId);
 
@@ -396,6 +401,63 @@ async function blockCar(car, session) {
   }
 
   return booking;
+}
+
+async function resolveCredentials(values) {
+  const filePath = values['auth-file'];
+  let fileCredentials = {};
+
+  if (filePath) {
+    fileCredentials = await readCredentialsFile(filePath);
+  }
+
+  const username = values.username ?? fileCredentials.username;
+  const password = values.password ?? fileCredentials.password;
+
+  if (!username || !password) {
+    if (filePath) {
+      throw new Error(
+        'Blocking a car requires both username and password provided either in the credentials file or via CLI flags.',
+      );
+    }
+    throw new Error(
+      'Blocking a car requires credentials. Provide --username/--password or use --auth-file <path>.',
+    );
+  }
+
+  return { username, password };
+}
+
+async function readCredentialsFile(filePath) {
+  let fileContents;
+  try {
+    fileContents = await readFile(filePath, 'utf8');
+  } catch (error) {
+    throw new Error(`Unable to read credentials file at ${filePath}: ${error.message}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fileContents);
+  } catch (error) {
+    throw new Error(
+      `Credentials file ${filePath} must be valid JSON containing "username" and "password" fields. ${error.message}`,
+    );
+  }
+
+  const username = parsed.username ?? parsed.user ?? parsed.email;
+  const password = parsed.password ?? parsed.pass;
+
+  if (!username || !password) {
+    throw new Error(
+      `Credentials file ${filePath} is missing required "username" and "password" values.`,
+    );
+  }
+
+  return {
+    username: String(username),
+    password: String(password),
+  };
 }
 
 function extractSessionCookie(header) {
