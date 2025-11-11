@@ -24,6 +24,18 @@ const { values } = parseArgs({
       type: 'string',
       short: 'l',
     },
+    radius: {
+      type: 'string',
+      short: 'r',
+    },
+    username: {
+      type: 'string',
+      short: 'U',
+    },
+    password: {
+      type: 'string',
+      short: 'P',
+    },
     help: {
       type: "boolean",
       short: "h",
@@ -41,12 +53,17 @@ Options:
     Object.keys(branchIds).join(", ")
   }
   -l, --location <coord>  Location coordinates (e.g. "43.7,-79.4")
+  -r, --radius <distance> Search radius in meters or kilometers (e.g. "500", "2km")
+  -U, --username <user>   Communauto login username (required to block a car)
+  -P, --password <pass>   Communauto login password (required to block a car)
   -h, --help              Show this help message
 
 Examples:
   node run.mjs --delay 30 --city montreal
   node run.mjs -d 10 -c vancouver
   node run.mjs -l "45.5,-73.6"
+  node run.mjs -r 2km
+  node run.mjs --city montreal --username you@example.com --password secret
   node run.mjs --help
 `);
   process.exit();
@@ -78,20 +95,34 @@ const distanceRadii = [
   200,
 ];
 
-let distanceRadius = distanceRadii[0];
+const defaultRadius = distanceRadii[0];
+
+const customRadius = values.radius ? parseRadius(values.radius) : undefined;
+
+let distanceRadius = customRadius ?? defaultRadius;
 
 let notificationId, notifyResult;
 
 if (!branchIds[values.city]) {
-  throw new Error(`City ${values.vity} not yet supported! File a bug`);
+  throw new Error(`City ${values.city} not yet supported! File a bug`);
 }
 const branchId = branchIds[values.city];
 
 console.log('Using City Branch: %s. Branch ID: %i', values.city, branchId);
 
 
+if (!values.username || !values.password) {
+  throw new Error('Blocking a car requires --username and --password credentials.');
+}
+
+const authSession = await login(values.username, values.password, branchId);
+
+console.log('Authenticated successfully. Customer ID: %s', authSession.customerId);
+
 const location = values.location ? values.location.split(',').map(c => parseFloat(c.trim())) : await retry(async () => await getLocation())
 console.log('Current location: %s, %s', ...location);
+
+console.log('Initial search radius: %s', humanDistance(distanceRadius));
 
 
 
@@ -120,7 +151,7 @@ while(true) {
       'critical',
       '-t', '6000',
       '-p',
-      '-A', 'open=Reserve',
+      '-A', 'block=Block car',
       '-A', 'stop=Stop looking',
       'Car found!',
       `${car.brand} ${car.model} is ${Math.floor(car.distance)}m away`
@@ -133,9 +164,15 @@ while(true) {
     const res = spawnSync('notify-send', args);
 
     [notificationId, notifyResult] = res.stdout.toString().split('\n');
+    if (notifyResult) notifyResult = notifyResult.trim();
     switch(notifyResult) {
-      case 'open':
-        spawnSync('xdg-open', [`https://${values.branchId === branchIds.toronto ? 'ontario' : 'quebec'}.client.reservauto.net/bookCar`]);
+      case 'block':
+        try {
+          const booking = await blockCar(car, authSession);
+          console.log('Block request completed: %j', booking);
+        } catch (err) {
+          console.error('Failed to block car: %s', err.message);
+        }
         break;
       case 'reduce' :
         distanceRadius = nextSmallerRadius;
@@ -167,12 +204,15 @@ async function getCars(location) {
   );
   const json = await result.json();
   return json.d.Vehicles.map( vehicle => ({
+    id: vehicle.CarId,
+    vin: vehicle.CarVin,
     brand: vehicle.CarBrand,
     model: vehicle.CarModel,
     plate: vehicle.CarPlate,
     color: vehicle.CarColor,
     lat: vehicle.Latitude,
     lng: vehicle.Longitude,
+    cityId: vehicle.CityID,
     distance: calculateDistance(...location, vehicle.Latitude, vehicle.Longitude),
   }));
 
@@ -260,4 +300,107 @@ async function retry(cb, times = 3, delay = 1000) {
 
   }
 
+}
+
+function parseRadius(input) {
+  const trimmed = input.trim().toLowerCase();
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)(km|m)?$/);
+
+  if (!match) {
+    throw new Error(`Invalid radius value: ${input}`);
+  }
+
+  const value = parseFloat(match[1]);
+  const unit = match[2] ?? 'm';
+
+  const distanceInMeters = unit === 'km' ? value * 1000 : value;
+
+  if (!Number.isFinite(distanceInMeters) || distanceInMeters <= 0) {
+    throw new Error(`Radius must be a positive number. Received: ${input}`);
+  }
+
+  return Math.round(distanceInMeters);
+}
+
+async function login(username, password, branchId) {
+  const url = new URL('https://www.reservauto.net/Scripts/Client/Ajax/Mobile/Login.asp');
+  url.searchParams.set('BranchID', branchId);
+  url.searchParams.set('Username', username);
+  url.searchParams.set('Password', password);
+  url.searchParams.set('RememberMe', 'true');
+
+  const response = await fetch(url, {
+    headers: {
+      'Accept': 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Login request failed with status ${response.status}`);
+  }
+
+  const sessionCookie = extractSessionCookie(response.headers.get('set-cookie'));
+
+  const body = await response.json();
+  const account = body?.data?.[0];
+
+  if (!account || !account.CustomerID) {
+    throw new Error('Invalid Communauto credentials.');
+  }
+
+  return {
+    customerId: account.CustomerID,
+    providerNo: account.ProviderNo,
+    cityId: account.CityID ? parseInt(account.CityID, 10) : undefined,
+    cookie: sessionCookie,
+  };
+}
+
+async function blockCar(car, session) {
+  if (!session?.customerId) {
+    throw new Error('Missing authenticated session.');
+  }
+
+  const payload = {
+    CustomerID: session.customerId,
+    CarID: car.id,
+    CarVIN: car.vin,
+    BranchID: branchId,
+    CityID: session.cityId ?? car.cityId ?? null,
+  };
+
+  const response = await fetch('https://www.reservauto.net/WCF/LSI/LSIBookingServiceV3.svc/CreateBookingPost', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      ...(session.cookie ? { Cookie: session.cookie } : {}),
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Booking request failed with status ${response.status}`);
+  }
+
+  const result = await response.json();
+
+  if (!result || typeof result !== 'object') {
+    throw new Error('Unexpected booking response.');
+  }
+
+  const booking = result.d ?? result;
+
+  if (booking?.Success === false || booking?.CreateBookingError) {
+    const errorMessage = booking.ErrorMessage || booking.CreateBookingError || 'Unknown error';
+    throw new Error(`Booking rejected: ${errorMessage}`);
+  }
+
+  return booking;
+}
+
+function extractSessionCookie(header) {
+  if (!header) return undefined;
+
+  const firstCookie = header.split(/,(?=[^;,]+=)/)[0] ?? header;
+  return firstCookie.split(';')[0];
 }
