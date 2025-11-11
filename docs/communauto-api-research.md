@@ -5,6 +5,7 @@
 
 ## Authentication requirements
 - The `Rental v2` specification declares an OAuth2 `authorizationCode` flow named `BearerDefinition` with authorize URL `https://foidentityprovider.reservauto.net/connect/authorize`, token URL `https://foidentityprovider.reservauto.net/connect/token`, and scope `reservautofrontofficerestapi`. Accessing protected endpoints (including the rental operations) therefore requires logging in through this flow.
+- The hosted IdentityServer instance performs a two-step HTML form login: the first page posts the branch selection and username to `/Login`, and the second page captures the password at `/Login/Password`. Both forms carry a `ReturnUrl` that leads back to the `signin-callback` endpoint for the branch once credentials are accepted.
 
 ```json
 "securitySchemes": {

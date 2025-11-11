@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execSync, spawnSync } from 'child_process';
 import { readFile } from 'fs/promises';
+import { randomBytes, createHash } from 'crypto';
 import { parseArgs } from 'util';
 
 const branchIds = {
@@ -8,6 +9,25 @@ const branchIds = {
   quebec: 2,
   toronto: 3,
 };
+
+const branchTenants = {
+  1: 'Communauto_Quebec',
+  2: 'Communauto_Ontario',
+  3: 'Communauto_Atlantic',
+};
+
+const branchDomains = {
+  1: 'quebec',
+  2: 'ontario',
+  3: 'atlantic',
+};
+
+const userAgent =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+const defaultHtmlAccept = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8';
+
+const defaultAcceptLanguage = 'en-CA,en;q=0.9,fr-CA;q=0.8,fr;q=0.7';
 
 const { values } = parseArgs({
   options: {
@@ -121,7 +141,7 @@ async function main() {
 
   const authSession = await login(credentials.username, credentials.password, branchId);
 
-  console.log('Authenticated successfully. Customer ID: %s', authSession.customerId);
+  console.log('Authenticated successfully. Access token expires in %ss', authSession.expiresIn ?? 'unknown');
 
   const location = values.location
     ? values.location.split(',').map(c => parseFloat(c.trim()))
@@ -328,125 +348,405 @@ function parseRadius(input) {
 }
 
 async function login(username, password, branchId) {
-  const baseUrl = 'https://www.reservauto.net/Scripts/Client/Ajax/Mobile/Login.asp';
-  const sharedHeaders = {
-    'Accept': 'application/json, text/javascript, */*; q=0.01',
-    'User-Agent': 'Mozilla/5.0 (Linux; Android 12; CommunautoBot) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36',
-    'Referer': `https://www.reservauto.net/Scripts/Client/Ajax/Mobile/Login.asp?BranchID=${branchId}`,
-  };
-
-  const queryParams = new URLSearchParams({
-    BranchID: String(branchId),
-    Username: username,
-    Password: password,
-    RememberMe: 'true',
-    LanguageID: '2',
-    callback: 'communautoLogin',
-  });
-
-  const loginResponse = await fetch(`${baseUrl}?${queryParams.toString()}`, {
-    method: 'GET',
-    headers: sharedHeaders,
-  });
-
-  if (!loginResponse.ok) {
-    throw new Error(`Login request failed with status ${loginResponse.status}`);
+  if (!username || !password) {
+    throw new Error('Username and password are required for authentication.');
   }
 
-  const loginBodyText = await loginResponse.text();
-  const loginBody = parseLoginBody(loginBodyText);
+  const tenant = branchTenants[branchId];
+  if (!tenant) {
+    throw new Error(`Unsupported branch ${branchId}.`);
+  }
 
-  const cookies = collectSetCookies(loginResponse.headers.get('set-cookie'));
+  const domain = branchDomains[branchId];
+  if (!domain) {
+    throw new Error(`Unable to resolve branch domain for ${branchId}.`);
+  }
 
-  let account = extractLoginAccount(loginBody);
+  const session = new HttpSession();
+  const { verifier, challenge } = createPkcePair();
+  const state = randomState();
+  const redirectUri = `https://${domain}.client.reservauto.net/signin-callback?branchId=${branchId}`;
 
-  if (!account || !hasNonEmptyLoginValue(account)) {
-    if (cookies.length) {
-      const sessionCookieHeader = cookies.join('; ');
-      const sessionResponse = await fetch(`${baseUrl}?URLEnd=URLEnd&BranchID=${branchId}`, {
-        method: 'GET',
-        headers: {
-          ...sharedHeaders,
-          Cookie: sessionCookieHeader,
-        },
-      });
+  const authorizeParams = new URLSearchParams({
+    client_id: 'CustomerSpaceClient',
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: 'openid profile reservautofrontofficerestapi communautorestapi offline_access',
+    state,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    response_mode: 'query',
+    ui_locales: 'en-ca',
+    acr_values: `tenant:${branchId}`,
+    branch_id: String(branchId),
+  });
 
-      if (sessionResponse.ok) {
-        const sessionBodyText = await sessionResponse.text();
-        const sessionBody = parseLoginBody(sessionBodyText);
-        const sessionCookies = collectSetCookies(sessionResponse.headers.get('set-cookie'));
-        if (sessionCookies.length) {
-          cookies.push(...sessionCookies);
-        }
-        const sessionAccount = extractLoginAccount(sessionBody);
-        if (sessionAccount && hasNonEmptyLoginValue(sessionAccount)) {
-          account = sessionAccount;
-        }
+  let currentUrl = new URL(`https://foidentityprovider.reservauto.net/connect/authorize?${authorizeParams.toString()}`);
+  let response = await session.fetch(currentUrl.toString(), { redirect: 'manual' });
+
+  if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
+    currentUrl = new URL(response.headers.get('location'), currentUrl);
+    response = await session.fetch(currentUrl.toString(), { redirect: 'manual' });
+  }
+
+  let html = await response.text();
+  if (!html || !/<form/i.test(html)) {
+    throw new Error('Unable to load Communauto login form. Received unexpected content.');
+  }
+
+  let forms = parseHtmlForms(html);
+  if (!forms.length) {
+    throw new Error('Unable to parse Communauto login form.');
+  }
+
+  let emailForm = forms.find(form => /login/i.test(form.action ?? '') && !/password/i.test(form.action ?? '')) ?? forms[0];
+  const emailFields = { ...emailForm.fields };
+  setFirstExistingField(emailFields, ['Input.Email', 'Input.EmailAddress', 'Input.Username', 'Input.Login', 'Email', 'email', 'username'], username);
+  setFirstExistingField(emailFields, ['Input.BranchId', 'Input.BranchID', 'Input.SelectedBranchId', 'BranchId', 'branchId'], tenant, { createIfMissing: true });
+  setFirstExistingField(emailFields, ['Input.LoginType', 'LoginType'], '0');
+  setFirstExistingField(emailFields, ['Input.RememberLogin', 'RememberLogin'], 'true');
+
+  const emailAction = resolveFormAction(emailForm.action, currentUrl);
+
+  response = await session.fetch(emailAction, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Referer': currentUrl.toString(),
+    },
+    body: buildFormBody(emailFields).toString(),
+  });
+
+  currentUrl = new URL(emailAction);
+
+  if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
+    currentUrl = new URL(response.headers.get('location'), currentUrl);
+    response = await session.fetch(currentUrl.toString(), { redirect: 'manual' });
+  }
+
+  html = await response.text();
+  if (!html || !/<form/i.test(html)) {
+    throw new Error('Unable to load Communauto password form.');
+  }
+
+  forms = parseHtmlForms(html);
+  if (!forms.length) {
+    throw new Error('Unable to parse Communauto password form.');
+  }
+
+  let passwordForm =
+    forms.find(form => /password/i.test(form.action ?? '')) ??
+    forms.find(form => /login/i.test(form.action ?? '')) ??
+    forms[0];
+  const passwordFields = { ...passwordForm.fields };
+  setFirstExistingField(passwordFields, ['Input.Password', 'Password', 'password'], password);
+  setFirstExistingField(passwordFields, ['Input.Email', 'Input.Username', 'Email', 'username'], username);
+  if (!passwordFields['Input.BranchId'] && !passwordFields.BranchId) {
+    setFirstExistingField(passwordFields, ['Input.BranchId', 'BranchId'], tenant, { createIfMissing: true });
+  }
+
+  const passwordAction = resolveFormAction(passwordForm.action, currentUrl);
+
+  response = await session.fetch(passwordAction, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Referer': currentUrl.toString(),
+    },
+    body: buildFormBody(passwordFields).toString(),
+  });
+
+  currentUrl = new URL(passwordAction);
+
+  let authorizationUrl = null;
+
+  for (let attempts = 0; attempts < 10; attempts += 1) {
+    if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
+      const location = new URL(response.headers.get('location'), currentUrl);
+      if (!authorizationUrl && location.searchParams.has('code')) {
+        authorizationUrl = location;
+      }
+      response = await session.fetch(location.toString(), { redirect: 'manual' });
+      currentUrl = location;
+      if (authorizationUrl && authorizationUrl.searchParams.has('code')) {
+        break;
+      }
+      continue;
+    }
+
+    const bodyText = await response.text();
+    const redirectMatch = bodyText.match(/window\.location(?:\.href)?\s*=\s*['"]([^'"\s]+)['"]/i);
+    if (redirectMatch) {
+      const location = new URL(redirectMatch[1], currentUrl);
+      if (!authorizationUrl && location.searchParams.has('code')) {
+        authorizationUrl = location;
+      }
+      response = await session.fetch(location.toString(), { redirect: 'manual' });
+      currentUrl = location;
+      if (authorizationUrl && authorizationUrl.searchParams.has('code')) {
+        break;
+      }
+      continue;
+    }
+
+    if (!authorizationUrl && currentUrl.searchParams.has('code')) {
+      authorizationUrl = currentUrl;
+    }
+    break;
+  }
+
+  if (!authorizationUrl || !authorizationUrl.searchParams.has('code')) {
+    throw new Error('Login flow did not yield an authorization code. Check credentials and branch selection.');
+  }
+
+  const authorizationCode = authorizationUrl.searchParams.get('code');
+  const returnedState = authorizationUrl.searchParams.get('state');
+  if (returnedState && returnedState !== state) {
+    throw new Error('Authorization server returned an unexpected state parameter.');
+  }
+
+  const tokenResponse = await session.fetch('https://foidentityprovider.reservauto.net/connect/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json',
+    },
+    body: new URLSearchParams({
+      client_id: 'CustomerSpaceClient',
+      grant_type: 'authorization_code',
+      code: authorizationCode,
+      redirect_uri: redirectUri,
+      code_verifier: verifier,
+    }).toString(),
+  });
+
+  if (!tokenResponse.ok) {
+    const errorBody = await safeReadJson(tokenResponse);
+    const errorMessage =
+      errorBody?.error_description || errorBody?.error || errorBody?.raw || `status ${tokenResponse.status}`;
+    throw new Error(`Token exchange failed: ${errorMessage}`);
+  }
+
+  const tokenBody = await tokenResponse.json();
+
+  if (!tokenBody?.access_token) {
+    throw new Error('Authorization server response did not include an access token.');
+  }
+
+  return {
+    accessToken: tokenBody.access_token,
+    refreshToken: tokenBody.refresh_token ?? null,
+    expiresIn: tokenBody.expires_in ?? null,
+    idToken: tokenBody.id_token ?? null,
+    tokenType: tokenBody.token_type ?? 'Bearer',
+  };
+}
+
+class HttpSession {
+  constructor() {
+    this.cookies = new Map();
+  }
+
+  async fetch(input, init = {}) {
+    const url = typeof input === 'string' ? input : input.toString();
+    const headers = new Headers(init.headers ?? {});
+
+    if (!headers.has('User-Agent')) {
+      headers.set('User-Agent', userAgent);
+    }
+    if (!headers.has('Accept')) {
+      headers.set('Accept', defaultHtmlAccept);
+    }
+    if (!headers.has('Accept-Language')) {
+      headers.set('Accept-Language', defaultAcceptLanguage);
+    }
+
+    if (!headers.has('Cookie') && this.cookies.size) {
+      headers.set('Cookie', this.serializeCookies());
+    }
+
+    const response = await fetch(url, { ...init, headers, redirect: init.redirect ?? 'follow' });
+    const setCookie = response.headers.get('set-cookie');
+    if (setCookie) {
+      this.storeCookies(setCookie);
+    }
+    return response;
+  }
+
+  storeCookies(header) {
+    for (const entry of splitSetCookieHeader(header)) {
+      const [name, ...rest] = entry.split('=');
+      if (!name) continue;
+      const value = rest.join('=');
+      const trimmedName = name.trim();
+      const trimmedValue = value.split(';')[0]?.trim() ?? '';
+      if (trimmedName) {
+        this.cookies.set(trimmedName, trimmedValue);
       }
     }
   }
 
-  if (!account) {
-    const message = extractLoginMessage(loginBody);
-    const fallback = hasLoginCandidate(loginBody)
-      ? 'Login rejected: Invalid username or password.'
-      : `Unexpected login response structure: ${truncateForError(loginBodyText)}`;
-    throw new Error(message ? `Login rejected: ${message}` : fallback);
+  serializeCookies() {
+    return Array.from(this.cookies.entries())
+      .map(([name, value]) => `${name}=${value}`)
+      .join('; ');
   }
-
-  const customerId = account.CustomerID ?? account.CustomerId ?? account.customerId;
-
-  if (!customerId || String(customerId).trim() === '') {
-    const message = extractLoginMessage(loginBody, account) ?? extractLoginMessage(account);
-    const fallback = isBlankAccount(account)
-      ? 'Invalid username or password.'
-      : 'Invalid Communauto credentials returned by login endpoint.';
-    throw new Error(`Login rejected: ${message ?? fallback}`);
-  }
-
-  const sessionCookie = cookies.length ? cookies.join('; ') : undefined;
-
-  return {
-    customerId,
-    providerNo:
-      account.ProviderNo ?? account.ProviderNO ?? account.providerNo ?? account.providerNO ?? undefined,
-    cityId: extractNumeric(account.CityID ?? account.CityId ?? account.cityId),
-    cookie: sessionCookie,
-  };
 }
 
-function collectSetCookies(header) {
+function splitSetCookieHeader(header) {
   if (!header) return [];
-  const entries = header
+  return header
     .split(/,(?=[^;,]+=)/g)
     .map(value => value.trim())
     .filter(Boolean);
-  const cookies = [];
-  for (const entry of entries) {
-    const [cookie] = entry.split(';');
-    if (cookie) cookies.push(cookie.trim());
+}
+
+function parseHtmlForms(html) {
+  const forms = [];
+  const formRegex = /<form\b[^>]*>[\s\S]*?<\/form>/gi;
+  let match;
+  while ((match = formRegex.exec(html))) {
+    const formHtml = match[0];
+    const actionMatch = formHtml.match(/action\s*=\s*["']([^"']*)["']/i);
+    const methodMatch = formHtml.match(/method\s*=\s*["']([^"']*)["']/i);
+    const fields = {};
+
+    const inputRegex = /<input\b[^>]*>/gi;
+    let inputMatch;
+    while ((inputMatch = inputRegex.exec(formHtml))) {
+      const inputTag = inputMatch[0];
+      const nameMatch = inputTag.match(/name\s*=\s*["']([^"']+)["']/i);
+      if (!nameMatch) continue;
+      const valueMatch = inputTag.match(/value\s*=\s*["']([^"']*)["']/i);
+      const typeMatch = inputTag.match(/type\s*=\s*["']([^"']*)["']/i);
+      const isCheckbox = typeMatch ? /checkbox/i.test(typeMatch[1]) : false;
+      const isRadio = typeMatch ? /radio/i.test(typeMatch[1]) : false;
+      let value = valueMatch ? decodeHtmlEntities(valueMatch[1]) : '';
+      if (!value && (isCheckbox || isRadio)) {
+        const checked = /checked/i.test(inputTag);
+        value = checked ? 'true' : '';
+      }
+      fields[nameMatch[1]] = value;
+    }
+
+    const selectRegex = /<select\b[^>]*name\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/select>/gi;
+    let selectMatch;
+    while ((selectMatch = selectRegex.exec(formHtml))) {
+      const [_, name, optionsHtml] = selectMatch;
+      const selectedOption =
+        optionsHtml.match(/<option[^>]*value\s*=\s*["']([^"']*)["'][^>]*selected[^>]*>/i) ||
+        optionsHtml.match(/<option[^>]*value\s*=\s*["']([^"']*)["'][^>]*>/i);
+      if (selectedOption) {
+        fields[name] = decodeHtmlEntities(selectedOption[1]);
+      }
+    }
+
+    forms.push({
+      action: actionMatch ? decodeHtmlEntities(actionMatch[1]) : '',
+      method: methodMatch ? methodMatch[1].toUpperCase() : 'GET',
+      fields,
+    });
   }
-  return cookies;
+  return forms;
+}
+
+function decodeHtmlEntities(value) {
+  return value
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
+function setFirstExistingField(fields, names, value, options = {}) {
+  if (value == null) return;
+  const { createIfMissing = false } = options;
+  const stringValue = typeof value === 'string' ? value : String(value);
+  for (const name of names) {
+    if (Object.prototype.hasOwnProperty.call(fields, name)) {
+      fields[name] = stringValue;
+      return;
+    }
+  }
+  if (createIfMissing) {
+    fields[names[0]] = stringValue;
+  }
+}
+
+function resolveFormAction(action, currentUrl) {
+  if (!action) {
+    return currentUrl.toString();
+  }
+  const trimmed = action.trim();
+  if (/^https?:/i.test(trimmed)) {
+    return trimmed;
+  }
+  if (trimmed.startsWith('//')) {
+    return `${currentUrl.protocol}${trimmed}`;
+  }
+  return new URL(trimmed, currentUrl).toString();
+}
+
+function buildFormBody(fields) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(fields)) {
+    params.append(key, value ?? '');
+  }
+  return params;
+}
+
+function randomState(size = 32) {
+  return toBase64Url(randomBytes(size));
+}
+
+function createPkcePair() {
+  const verifier = toBase64Url(randomBytes(32));
+  const challenge = toBase64Url(createHash('sha256').update(verifier).digest());
+  return { verifier, challenge };
+}
+
+function toBase64Url(buffer) {
+  return Buffer.from(buffer)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+async function safeReadJson(response) {
+  try {
+    return await response.clone().json();
+  } catch (error) {
+    try {
+      const text = await response.clone().text();
+      return text ? { raw: text } : null;
+    } catch {
+      return null;
+    }
+  }
 }
 
 async function blockCar(car, session) {
-  if (!session?.customerId) {
+  if (!session?.accessToken) {
     throw new Error('Missing authenticated session.');
   }
 
   const payload = {
-    CustomerID: session.customerId,
-    CarID: car.id,
-    CarVIN: car.vin,
-    BranchID: branchId,
-    CityID: session.cityId ?? car.cityId ?? null,
+    vehicleId: car.id,
+    branchId,
   };
 
-  const response = await fetch('https://www.reservauto.net/WCF/LSI/LSIBookingServiceV3.svc/CreateBookingPost', {
+  const response = await fetch('https://restapifrontoffice.reservauto.net/api/v2/Rental/FreeFloating', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      ...(session.cookie ? { Cookie: session.cookie } : {}),
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'Accept-Language': defaultAcceptLanguage,
+      Authorization: `${session.tokenType ?? 'Bearer'} ${session.accessToken}`,
     },
     body: JSON.stringify(payload),
   });
@@ -461,14 +761,16 @@ async function blockCar(car, session) {
     throw new Error('Unexpected booking response.');
   }
 
-  const booking = result.d ?? result;
-
-  if (booking?.Success === false || booking?.CreateBookingError) {
-    const errorMessage = booking.ErrorMessage || booking.CreateBookingError || 'Unknown error';
-    throw new Error(`Booking rejected: ${errorMessage}`);
+  if (result.success === false || result.error || result.errorMessage || Array.isArray(result.errors)) {
+    const message =
+      result.errorMessage ||
+      (Array.isArray(result.errors) ? result.errors.map(err => err.message ?? err).join('; ') : undefined) ||
+      result.error ||
+      'Unknown error';
+    throw new Error(`Booking rejected: ${message}`);
   }
 
-  return booking;
+  return result;
 }
 
 async function resolveCredentials(values) {
@@ -558,135 +860,5 @@ function parseCredentialFallback(contents) {
   return Object.keys(data).length ? data : null;
 }
 
-function parseLoginBody(rawBody) {
-  if (!rawBody) return {};
-
-  const trimmed = rawBody.trim();
-  if (!trimmed) return {};
-
-  try {
-    return JSON.parse(trimmed);
-  } catch (error) {
-    const jsonpMatch = trimmed.match(/^[^(]+\((.*)\)$/s);
-    if (jsonpMatch) {
-      return parseLoginBody(jsonpMatch[1]);
-    }
-    throw new Error(`Unexpected login response: ${truncateForError(trimmed)}`);
-  }
-}
-
-const loginFieldKeys = [
-  'CustomerID',
-  'CustomerId',
-  'customerId',
-  'ProviderNo',
-  'ProviderNO',
-  'providerNo',
-  'Access',
-  'access',
-  'CityID',
-  'CityId',
-  'cityId',
-  'NbrBlock',
-  'BalanceTypeGrace_Delay',
-  'BalanceTypeGrace_Max',
-  'BalanceTypeGrace_BankError',
-];
-
-function extractLoginAccount(body) {
-  const candidates = collectLoginCandidates(body);
-  return candidates.find(hasNonEmptyLoginValue) ?? candidates[0] ?? null;
-}
-
-function hasLoginCandidate(body) {
-  return collectLoginCandidates(body).length > 0;
-}
-
-function collectLoginCandidates(body) {
-  const candidates = [];
-  const seen = new Set();
-
-  const visit = value => {
-    if (!value || typeof value !== 'object') return;
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        visit(item);
-      }
-      return;
-    }
-
-    if (seen.has(value)) return;
-    seen.add(value);
-
-    if (hasLoginFields(value)) {
-      candidates.push(value);
-    }
-
-    for (const key of Object.keys(value)) {
-      visit(value[key]);
-    }
-  };
-
-  visit(body?.data);
-  visit(body?.Data);
-  visit(body?.d);
-  visit(body);
-
-  return candidates;
-}
-
-function hasLoginFields(value) {
-  if (!value || typeof value !== 'object') return false;
-  return loginFieldKeys.some(key => Object.prototype.hasOwnProperty.call(value, key));
-}
-
-function hasNonEmptyLoginValue(value) {
-  if (!value || typeof value !== 'object') return false;
-  return loginFieldKeys.some(key => {
-    if (!Object.prototype.hasOwnProperty.call(value, key)) return false;
-    const fieldValue = value[key];
-    if (fieldValue == null) return false;
-    if (typeof fieldValue === 'string') {
-      return fieldValue.trim() !== '';
-    }
-    return true;
-  });
-}
-
-function extractLoginMessage(body, account) {
-  const sources = [
-    body?.Message,
-    body?.ErrorMessage,
-    body?.message,
-    body?.error,
-    account?.Message,
-    account?.ErrorMessage,
-    Array.isArray(body?.errors) ? body.errors.map(err => err.message ?? err.Message).join('; ') : undefined,
-  ];
-
-  return sources.find(value => typeof value === 'string' && value.trim())?.trim();
-}
-
-function isBlankAccount(account) {
-  if (!account || typeof account !== 'object') return false;
-  return loginFieldKeys.every(key => {
-    if (!Object.prototype.hasOwnProperty.call(account, key)) return true;
-    const value = account[key];
-    if (value == null) return true;
-    if (typeof value === 'string') return value.trim() === '';
-    return false;
-  });
-}
-
-function truncateForError(text, max = 200) {
-  if (text.length <= max) return text;
-  return `${text.slice(0, max)}…`;
-}
-
-function extractNumeric(value) {
-  if (value == null) return undefined;
-  const number = parseInt(value, 10);
-  return Number.isFinite(number) ? number : undefined;
-}
 
 await main();

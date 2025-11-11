@@ -4,8 +4,8 @@ Look for close-by Communauto flex cars and get an alert
 Sick of refreshing the app or (even worse!) the web app for a close-by car?
 This command-line script checks nearby cars on a loop and pops up a desktop
 notification when it finds one. If you supply your Communauto credentials the
-notification action will immediately block the closest car for you through the
-legacy booking endpoint.
+notification action will run the same OAuth2 login flow as the web app and use
+Communauto's FrontOffice rental API to block the closest car for you.
 
 ![CLI output](image/screenshot1.png)
 
@@ -58,6 +58,10 @@ Examples:
   node run.mjs --auth-file creds.json
   node run.mjs --help
 ```
+
+> **Note:** Communauto reuses the `quebec.client.reservauto.net` domain for the
+> Montreal branch. The script automatically maps the supported cities to the
+> proper FrontOffice tenant during login.
 
 To load credentials from disk, you can either create a JSON file that looks like this:
 
