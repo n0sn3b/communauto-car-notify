@@ -61,7 +61,7 @@ Options:
   -r, --radius <distance> Search radius in meters or kilometers (e.g. "500", "2km")
   -U, --username <user>   Communauto login username (required to block a car)
   -P, --password <pass>   Communauto login password (required to block a car)
-  -F, --auth-file <path>  Path to JSON credentials file with "username" and "password"
+  -F, --auth-file <path>  Path to credentials file with Communauto username/password
   -h, --help              Show this help message
 
 Examples:
@@ -328,16 +328,23 @@ function parseRadius(input) {
 }
 
 async function login(username, password, branchId) {
-  const url = new URL('https://www.reservauto.net/Scripts/Client/Ajax/Mobile/Login.asp');
-  url.searchParams.set('BranchID', branchId);
-  url.searchParams.set('Username', username);
-  url.searchParams.set('Password', password);
-  url.searchParams.set('RememberMe', 'true');
+  const url = 'https://www.reservauto.net/Scripts/Client/Ajax/Mobile/Login.asp';
+  const form = new URLSearchParams({
+    BranchID: String(branchId),
+    Username: username,
+    Password: password,
+    RememberMe: 'true',
+    LanguageID: '2',
+  });
 
   const response = await fetch(url, {
+    method: 'POST',
     headers: {
-      'Accept': 'application/json',
+      'Accept': 'application/json, text/javascript, */*; q=0.01',
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'X-Requested-With': 'XMLHttpRequest',
     },
+    body: form.toString(),
   });
 
   if (!response.ok) {
@@ -346,17 +353,28 @@ async function login(username, password, branchId) {
 
   const sessionCookie = extractSessionCookie(response.headers.get('set-cookie'));
 
-  const body = await response.json();
-  const account = body?.data?.[0];
+  const rawBody = await response.text();
+  let body;
+  try {
+    body = rawBody ? JSON.parse(rawBody) : {};
+  } catch (error) {
+    throw new Error(`Unexpected login response: ${rawBody.slice(0, 200)}`);
+  }
 
-  if (!account || !account.CustomerID) {
-    throw new Error('Invalid Communauto credentials.');
+  const account = Array.isArray(body?.data) ? body.data[0] : body?.data ?? body?.Data ?? null;
+  const customerId = account?.CustomerID ?? account?.CustomerId;
+
+  if (!customerId) {
+    const message = body?.Message || body?.ErrorMessage || account?.Message;
+    throw new Error(
+      message ? `Login rejected: ${message}` : 'Invalid Communauto credentials returned by login endpoint.',
+    );
   }
 
   return {
-    customerId: account.CustomerID,
-    providerNo: account.ProviderNo,
-    cityId: account.CityID ? parseInt(account.CityID, 10) : undefined,
+    customerId,
+    providerNo: account?.ProviderNo ?? account?.ProviderNO ?? undefined,
+    cityId: account?.CityID ? parseInt(account.CityID, 10) : account?.CityId ? parseInt(account.CityId, 10) : undefined,
     cookie: sessionCookie,
   };
 }
@@ -436,17 +454,20 @@ async function readCredentialsFile(filePath) {
     throw new Error(`Unable to read credentials file at ${filePath}: ${error.message}`);
   }
 
-  let parsed;
+  let parsed = {};
   try {
     parsed = JSON.parse(fileContents);
   } catch (error) {
-    throw new Error(
-      `Credentials file ${filePath} must be valid JSON containing "username" and "password" fields. ${error.message}`,
-    );
+    parsed = parseCredentialFallback(fileContents);
+    if (!parsed) {
+      throw new Error(
+        `Credentials file ${filePath} must be JSON or key=value pairs containing username/password. ${error.message}`,
+      );
+    }
   }
 
-  const username = parsed.username ?? parsed.user ?? parsed.email;
-  const password = parsed.password ?? parsed.pass;
+  const username = parsed.username ?? parsed.user ?? parsed.email ?? parsed.login ?? parsed.USERNAME ?? parsed.EMAIL;
+  const password = parsed.password ?? parsed.pass ?? parsed.PASSWORD ?? parsed.PASS;
 
   if (!username || !password) {
     throw new Error(
@@ -455,9 +476,36 @@ async function readCredentialsFile(filePath) {
   }
 
   return {
-    username: String(username),
-    password: String(password),
+    username: String(username).trim(),
+    password: String(password).trim(),
   };
+}
+
+function parseCredentialFallback(contents) {
+  const lines = contents
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+
+  if (!lines.length) {
+    return null;
+  }
+
+  const data = {};
+
+  for (const line of lines) {
+    const match = line.match(/^(\w+)[\s:=]+(.+)$/);
+    if (match) {
+      const [, key, value] = match;
+      data[key] = value.trim();
+    }
+  }
+
+  if (!data.username && !data.user && !data.email && lines.length >= 2 && !lines[0].includes('=') && !lines[0].includes(':')) {
+    [data.username, data.password] = lines.slice(0, 2);
+  }
+
+  return Object.keys(data).length ? data : null;
 }
 
 function extractSessionCookie(header) {
