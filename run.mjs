@@ -360,20 +360,20 @@ async function login(username, password, branchId) {
   const account = extractLoginAccount(body);
   if (!account) {
     const message = extractLoginMessage(body);
-    throw new Error(
-      message
-        ? `Login rejected: ${message}`
-        : `Unexpected login response structure: ${truncateForError(rawBody)}`,
-    );
+    const fallback = hasLoginCandidate(body)
+      ? 'Login rejected: Invalid username or password.'
+      : `Unexpected login response structure: ${truncateForError(rawBody)}`;
+    throw new Error(message ? `Login rejected: ${message}` : fallback);
   }
 
   const customerId = account.CustomerID ?? account.CustomerId ?? account.customerId;
 
   if (!customerId) {
     const message = extractLoginMessage(body, account);
-    throw new Error(
-      message ? `Login rejected: ${message}` : 'Invalid Communauto credentials returned by login endpoint.',
-    );
+    const fallback = isBlankAccount(account)
+      ? 'Invalid username or password.'
+      : 'Invalid Communauto credentials returned by login endpoint.';
+    throw new Error(`Login rejected: ${message ?? fallback}`);
   }
 
   const sessionCookie = extractSessionCookie(response.headers.get('set-cookie'));
@@ -541,30 +541,82 @@ function parseLoginBody(rawBody) {
   }
 }
 
-function extractLoginAccount(body) {
-  const candidates = [];
+const loginFieldKeys = [
+  'CustomerID',
+  'CustomerId',
+  'customerId',
+  'ProviderNo',
+  'ProviderNO',
+  'providerNo',
+  'Access',
+  'access',
+  'CityID',
+  'CityId',
+  'cityId',
+  'NbrBlock',
+  'BalanceTypeGrace_Delay',
+  'BalanceTypeGrace_Max',
+  'BalanceTypeGrace_BankError',
+];
 
-  const pushCandidate = value => {
+function extractLoginAccount(body) {
+  const candidates = collectLoginCandidates(body);
+  return candidates.find(hasNonEmptyLoginValue) ?? candidates[0] ?? null;
+}
+
+function hasLoginCandidate(body) {
+  return collectLoginCandidates(body).length > 0;
+}
+
+function collectLoginCandidates(body) {
+  const candidates = [];
+  const seen = new Set();
+
+  const visit = value => {
     if (!value || typeof value !== 'object') return;
     if (Array.isArray(value)) {
       for (const item of value) {
-        if (item && typeof item === 'object') {
-          candidates.push(item);
-        }
+        visit(item);
       }
-    } else {
+      return;
+    }
+
+    if (seen.has(value)) return;
+    seen.add(value);
+
+    if (hasLoginFields(value)) {
       candidates.push(value);
+    }
+
+    for (const key of Object.keys(value)) {
+      visit(value[key]);
     }
   };
 
-  pushCandidate(body?.data);
-  pushCandidate(body?.Data);
-  pushCandidate(body?.d);
-  pushCandidate(body);
+  visit(body?.data);
+  visit(body?.Data);
+  visit(body?.d);
+  visit(body);
 
-  return candidates.find(item =>
-    item && (item.CustomerID || item.CustomerId || item.customerId || item.ProviderNo || item.Access),
-  ) ?? null;
+  return candidates;
+}
+
+function hasLoginFields(value) {
+  if (!value || typeof value !== 'object') return false;
+  return loginFieldKeys.some(key => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function hasNonEmptyLoginValue(value) {
+  if (!value || typeof value !== 'object') return false;
+  return loginFieldKeys.some(key => {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) return false;
+    const fieldValue = value[key];
+    if (fieldValue == null) return false;
+    if (typeof fieldValue === 'string') {
+      return fieldValue.trim() !== '';
+    }
+    return true;
+  });
 }
 
 function extractLoginMessage(body, account) {
@@ -579,6 +631,17 @@ function extractLoginMessage(body, account) {
   ];
 
   return sources.find(value => typeof value === 'string' && value.trim())?.trim();
+}
+
+function isBlankAccount(account) {
+  if (!account || typeof account !== 'object') return false;
+  return loginFieldKeys.every(key => {
+    if (!Object.prototype.hasOwnProperty.call(account, key)) return true;
+    const value = account[key];
+    if (value == null) return true;
+    if (typeof value === 'string') return value.trim() === '';
+    return false;
+  });
 }
 
 function truncateForError(text, max = 200) {
